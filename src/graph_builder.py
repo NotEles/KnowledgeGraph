@@ -320,3 +320,19 @@ class KGBuilder:
         with self.driver.session() as session:
             result = session.run(query, head_name=head_entity, tail_name=tail_entity)
             return result.single()
+
+    def add_relation_by_key(self, head_entity_key, head_label, relation, tail_entity_key, tail_label):
+        """Create a relation between two resolved Entity nodes using stable keys."""
+        query = f"""
+        MATCH (h:Entity:{head_label} {{entity_key: $head_entity_key}})
+        MATCH (t:Entity:{tail_label} {{entity_key: $tail_entity_key}})
+        MERGE (h)-[r:{relation}]->(t)
+        RETURN h.entity_key AS head_entity_key, type(r) AS relation, t.entity_key AS tail_entity_key
+        """
+        with self.driver.session() as session:
+            result = session.run(
+                query,
+                head_entity_key=head_entity_key,
+                tail_entity_key=tail_entity_key,
+            )
+            return result.single()
