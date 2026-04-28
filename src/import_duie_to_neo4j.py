@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from crf import CRFNERExtractor
+from entity_resolver import EntityResolver
 from graph_builder import KGBuilder
 
 
@@ -48,9 +49,9 @@ def _safe_label(label, default="Entity"):
 def import_duie_entities_to_neo4j(
     data_path,
     model_path="ner_model.pkl",
-    uri="bolt://localhost:7687",
+    uri="bolt://localhost:7688",
     user="neo4j",
-    password="password",
+    password="your_new_password",
     limit=None,
 ):
     """
@@ -68,8 +69,12 @@ def import_duie_entities_to_neo4j(
         records = records[:limit]
 
     kg = KGBuilder(uri, user, password)
+    resolver = EntityResolver(kg)
     try:
+        kg.ensure_disambiguation_schema()
+        kg.backfill_entity_keys()
         total_mentions = 0
+        decision_stats = {"resolved": 0, "new": 0}
         for index, record in enumerate(records, start=1):
             text = record.get("text", "")
             if not text:
@@ -82,18 +87,44 @@ def import_duie_entities_to_neo4j(
 
             for entity_name, entity_type in entities:
                 entity_label = _safe_label(entity_type, default="Entity")
-                kg.add_relation(
-                    doc_name,
-                    "Document",
-                    "MENTIONS",
+                resolved = resolver.resolve(entity_name, entity_label, source_text=text)
+                canonical_name = resolved["canonical_name"]
+                entity_key = resolved["entity_key"]
+
+                kg.upsert_entity_by_key(
+                    entity_key,
+                    canonical_name,
+                    entity_label,
+                    norm_name=resolved["norm_name"],
+                    domain=resolved["domain"],
+                )
+                kg.add_alias_by_key(
+                    entity_key,
+                    entity_label,
                     entity_name,
+                    resolved["norm_name"],
+                )
+                kg.add_document_mention(
+                    doc_name,
+                    entity_key,
                     entity_label,
                 )
+                kg.update_entity_profile(
+                    entity_key,
+                    context_terms=resolved["context_terms"],
+                    domain=resolved["domain"],
+                )
                 total_mentions += 1
+                decision_stats[resolved["decision"]] += 1
 
             print(f"已处理第 {index} 条，识别到 {len(entities)} 个实体")
 
         print(f"导入完成，共写入 {total_mentions} 条 MENTIONS 关系")
+        print(
+            "消歧决策统计: "
+            f"resolved={decision_stats['resolved']}, "
+            f"new={decision_stats['new']}"
+        )
     finally:
         kg.close()
 
@@ -103,8 +134,8 @@ if __name__ == "__main__":
     import_duie_entities_to_neo4j(
         data_path=default_path,
         model_path="ner_model.pkl",
-        uri="bolt://localhost:7687",
+        uri="bolt://localhost:7688",
         user="neo4j",
-        password="password",
+        password="your_new_password",
         limit=100,
     )

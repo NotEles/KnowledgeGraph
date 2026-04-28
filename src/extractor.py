@@ -101,9 +101,9 @@ def main():
         default=5,
         help="Number of rows from the top of the CSV to process",
     )
-    parser.add_argument("--uri", default="bolt://localhost:7687", help="Neo4j URI")
+    parser.add_argument("--uri", default="bolt://localhost:7688", help="Neo4j URI")
     parser.add_argument("--user", default="neo4j", help="Neo4j user")
-    parser.add_argument("--password", default="password", help="Neo4j password")
+    parser.add_argument("--password", default="your_new_password", help="Neo4j password")
     args = parser.parse_args()
 
     extractor = TMDBExtractor(args.csv)

@@ -72,7 +72,7 @@ class CRFNERExtractor:
         else:
             features['EOS'] = True
         return features
-    def train(self, json_file_path, limit=50000):
+    def train(self, json_file_path, limit=5000):
         """从 DuIE 文件训练模型"""
         X, y = [], []
         with open(json_file_path, 'r', encoding='utf-8') as f:
@@ -121,7 +121,7 @@ class CRFNERExtractor:
 
 if __name__ == "__main__":
     extractor = CRFNERExtractor()
-    #extractor.train("./KnowledgeGraph/sample/DuIE2.0/duie_train.json/duie_train.json") # 第一次运行需训练
-    extractor.load() # 之后直接加载模型进行推理
+    extractor.train("./KnowledgeGraph/sample/DuIE2.0/duie_train.json/duie_train.json") # 第一次运行需训练
+    #extractor.load() # 之后直接加载模型进行推理   
     res = extractor.extract_entities("林俊杰考上了武汉大学。")
     print(res) # [('林俊杰', 'PER'), ('武汉大学', 'ORG')]
