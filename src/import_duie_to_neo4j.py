@@ -72,7 +72,6 @@ def import_duie_entities_to_neo4j(
     resolver = EntityResolver(kg)
     try:
         kg.ensure_disambiguation_schema()
-        kg.backfill_entity_keys()
         total_mentions = 0
         decision_stats = {"resolved": 0, "new": 0}
         for index, record in enumerate(records, start=1):
@@ -98,12 +97,6 @@ def import_duie_entities_to_neo4j(
                     norm_name=resolved["norm_name"],
                     domain=resolved["domain"],
                 )
-                kg.add_alias_by_key(
-                    entity_key,
-                    entity_label,
-                    entity_name,
-                    resolved["norm_name"],
-                )
                 kg.add_document_mention(
                     doc_name,
                     entity_key,
@@ -111,6 +104,7 @@ def import_duie_entities_to_neo4j(
                 )
                 kg.update_entity_profile(
                     entity_key,
+                    entity_label,
                     context_terms=resolved["context_terms"],
                     domain=resolved["domain"],
                 )

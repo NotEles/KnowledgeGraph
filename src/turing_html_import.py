@@ -273,7 +273,6 @@ def import_turing_html(
 
     try:
         kg.ensure_disambiguation_schema()
-        kg.backfill_entity_keys()
 
         document_name = extractor.html_path.stem
         mention_counter = 0
@@ -297,15 +296,10 @@ def import_turing_html(
                 norm_name=resolved["norm_name"],
                 domain=resolved["domain"],
             )
-            kg.add_alias_by_key(
-                resolved["entity_key"],
-                mention["label"],
-                mention["text"],
-                resolved["norm_name"],
-            )
             kg.add_document_mention(document_name, resolved["entity_key"], mention["label"])
             kg.update_entity_profile(
                 resolved["entity_key"],
+                mention["label"],
                 context_terms=mention.get("context", "").split(),
                 domain=resolved["domain"],
             )
@@ -336,18 +330,6 @@ def import_turing_html(
                 triple["tail_label"],
                 norm_name=tail_resolved["norm_name"],
                 domain=tail_resolved["domain"],
-            )
-            kg.add_alias_by_key(
-                head_resolved["entity_key"],
-                triple["head_label"],
-                triple["head"],
-                head_resolved["norm_name"],
-            )
-            kg.add_alias_by_key(
-                tail_resolved["entity_key"],
-                triple["tail_label"],
-                triple["tail"],
-                tail_resolved["norm_name"],
             )
             kg.add_relation_by_key(
                 head_resolved["entity_key"],
