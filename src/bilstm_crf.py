@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, pad_sequence
+from torch.utils.data import DataLoader
 
 
 START_TAG = "<START>"
@@ -50,12 +52,31 @@ class BiLSTMCRF(nn.Module):
         max_score = tensor.max()
         return max_score + torch.log(torch.sum(torch.exp(tensor - max_score)))
 
-    def _get_lstm_features(self, sentence_ids):
-        if sentence_ids.dim() == 1:
+    def _get_lstm_features(self, sentence_ids, lengths=None):
+        single_input = sentence_ids.dim() == 1
+        if single_input:
             sentence_ids = sentence_ids.unsqueeze(0)
+
         embeds = self.embedding(sentence_ids)
-        lstm_out, _ = self.lstm(embeds)
-        feats = self.hidden2tag(lstm_out.squeeze(0))
+        if lengths is not None:
+            packed = pack_padded_sequence(
+                embeds,
+                lengths.detach().cpu(),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            packed_out, _ = self.lstm(packed)
+            lstm_out, _ = pad_packed_sequence(
+                packed_out,
+                batch_first=True,
+                total_length=sentence_ids.size(1),
+            )
+        else:
+            lstm_out, _ = self.lstm(embeds)
+
+        feats = self.hidden2tag(lstm_out)
+        if single_input and lengths is None:
+            return feats.squeeze(0)
         return feats
 
     def _forward_alg(self, feats):
@@ -76,6 +97,26 @@ class BiLSTMCRF(nn.Module):
         alpha = self._log_sum_exp(terminal_var)
         return alpha
 
+    def _forward_alg_batch(self, feats, lengths):
+        batch_size, max_len, _ = feats.shape
+        init_alphas = torch.full((batch_size, self.tagset_size), -10000.0, device=feats.device)
+        init_alphas[:, self.tag_to_ix[START_TAG]] = 0.0
+
+        forward_var = init_alphas
+        for step in range(max_len):
+            active_mask = (step < lengths).unsqueeze(1)
+            if not torch.any(active_mask):
+                break
+
+            feat = feats[:, step]
+            score = forward_var.unsqueeze(1) + self.transitions.unsqueeze(0)
+            score = score + feat.unsqueeze(2)
+            next_forward_var = torch.logsumexp(score, dim=2)
+            forward_var = torch.where(active_mask, next_forward_var, forward_var)
+
+        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]].unsqueeze(0)
+        return torch.logsumexp(terminal_var, dim=1)
+
     def _score_sentence(self, feats, tags):
         score = torch.tensor(0.0, device=feats.device)
         tags = torch.cat(
@@ -87,6 +128,23 @@ class BiLSTMCRF(nn.Module):
         for index, feat in enumerate(feats):
             score = score + self.transitions[tags[index + 1], tags[index]] + feat[tags[index + 1]]
         score = score + self.transitions[self.tag_to_ix[STOP_TAG], tags[-1]]
+        return score
+
+    def _score_sentence_batch(self, feats, tags, lengths):
+        batch_size, max_len, _ = feats.shape
+        start_tags = torch.full((batch_size, 1), self.tag_to_ix[START_TAG], dtype=torch.long, device=feats.device)
+        prev_tags = torch.cat([start_tags, tags[:, :-1]], dim=1)
+        current_tags = tags
+
+        emission_scores = feats.gather(2, current_tags.unsqueeze(-1)).squeeze(-1)
+        transition_scores = self.transitions[current_tags, prev_tags]
+
+        mask = torch.arange(max_len, device=feats.device).unsqueeze(0) < lengths.unsqueeze(1)
+        score = ((emission_scores + transition_scores) * mask).sum(dim=1)
+
+        last_tag_indices = lengths - 1
+        last_tags = tags.gather(1, last_tag_indices.unsqueeze(1)).squeeze(1)
+        score = score + self.transitions[self.tag_to_ix[STOP_TAG], last_tags]
         return score
 
     def _viterbi_decode(self, feats):
@@ -122,9 +180,18 @@ class BiLSTMCRF(nn.Module):
 
     def neg_log_likelihood(self, sentence_ids, tags):
         feats = self._get_lstm_features(sentence_ids)
+        return self._neg_log_likelihood_from_feats(feats, tags)
+
+    def _neg_log_likelihood_from_feats(self, feats, tags):
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
         return forward_score - gold_score
+
+    def neg_log_likelihood_batch(self, sentence_ids, tags, lengths):
+        feats = self._get_lstm_features(sentence_ids, lengths=lengths)
+        forward_score = self._forward_alg_batch(feats, lengths)
+        gold_score = self._score_sentence_batch(feats, tags, lengths)
+        return (forward_score - gold_score).mean()
 
     def forward(self, sentence_ids):
         feats = self._get_lstm_features(sentence_ids)
@@ -280,7 +347,15 @@ class CRFNERExtractor:
     def _encode_labels(self, labels):
         return [self.tag_to_ix[label] for label in labels]
 
-    def train(self, data_file_path, limit=5000, epochs=8, learning_rate=0.001, seed=42):
+    def _collate_examples(self, batch):
+        sentence_ids = [torch.tensor(self._encode_text(example.text), dtype=torch.long) for example in batch]
+        label_ids = [torch.tensor(self._encode_labels(example.labels), dtype=torch.long) for example in batch]
+        lengths = torch.tensor([item.size(0) for item in sentence_ids], dtype=torch.long)
+        padded_sentences = pad_sequence(sentence_ids, batch_first=True, padding_value=self.vocab[PAD_TOKEN])
+        padded_labels = pad_sequence(label_ids, batch_first=True, padding_value=self.tag_to_ix[STOP_TAG])
+        return padded_sentences, padded_labels, lengths
+
+    def train(self, data_file_path, limit=5000, epochs=8, learning_rate=0.001, seed=42, batch_size=32, num_workers=0):
         records = self._load_records(data_file_path, limit=limit)
         examples = self._records_to_examples(records)
         if not examples:
@@ -299,23 +374,31 @@ class CRFNERExtractor:
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         use_amp = use_cuda and self.use_amp
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        train_loader = DataLoader(
+            examples,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=use_cuda,
+            collate_fn=self._collate_examples,
+        )
 
         self.model.train()
         for epoch in range(epochs):
-            random.shuffle(examples)
             total_loss = 0.0
-            for example in examples:
-                sentence_ids = torch.tensor(self._encode_text(example.text), dtype=torch.long, device=self.device)
-                label_ids = torch.tensor(self._encode_labels(example.labels), dtype=torch.long, device=self.device)
+            for sentence_ids, label_ids, lengths in train_loader:
+                sentence_ids = sentence_ids.to(self.device, non_blocking=use_cuda)
+                label_ids = label_ids.to(self.device, non_blocking=use_cuda)
+                lengths = lengths.to(self.device, non_blocking=use_cuda)
 
-                self.model.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    loss = self.model.neg_log_likelihood(sentence_ids, label_ids)
+                    loss = self.model.neg_log_likelihood_batch(sentence_ids, label_ids, lengths)
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-                total_loss += float(loss.detach().item())
+                total_loss += float(loss.detach().item()) * sentence_ids.size(0)
 
             avg_loss = total_loss / max(len(examples), 1)
             print(f"Epoch {epoch + 1}/{epochs} - avg loss: {avg_loss:.4f}")

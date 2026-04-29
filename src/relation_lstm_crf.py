@@ -3,6 +3,8 @@ import os
 import random
 
 import torch
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
 
 from bilstm_crf import BiLSTMCRF, START_TAG, STOP_TAG, PAD_TOKEN, UNK_TOKEN
 
@@ -156,7 +158,15 @@ class CRFRelationExtractor:
     def _encode_labels(self, labels):
         return [self.tag_to_ix[label] for label in labels]
 
-    def train(self, data_file_path, limit=10000, epochs=8, learning_rate=0.001, seed=42):
+    def _collate_examples(self, batch):
+        sentence_ids = [torch.tensor(self._encode_text(text), dtype=torch.long) for text, _ in batch]
+        label_ids = [torch.tensor(self._encode_labels(labels), dtype=torch.long) for _, labels in batch]
+        lengths = torch.tensor([item.size(0) for item in sentence_ids], dtype=torch.long)
+        padded_sentences = pad_sequence(sentence_ids, batch_first=True, padding_value=self.vocab[PAD_TOKEN])
+        padded_labels = pad_sequence(label_ids, batch_first=True, padding_value=self.tag_to_ix[STOP_TAG])
+        return padded_sentences, padded_labels, lengths
+
+    def train(self, data_file_path, limit=10000, epochs=8, learning_rate=0.001, seed=42, batch_size=32, num_workers=0):
         records = self._load_records(data_file_path, limit=limit)
         examples = self._records_to_examples(records)
         if not examples:
@@ -175,22 +185,31 @@ class CRFRelationExtractor:
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         use_amp = use_cuda and self.use_amp
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        train_loader = DataLoader(
+            examples,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=use_cuda,
+            collate_fn=self._collate_examples,
+        )
 
         self.model.train()
         for epoch in range(epochs):
-            random.shuffle(examples)
             total_loss = 0.0
-            for text, labels in examples:
-                sentence_ids = torch.tensor(self._encode_text(text), dtype=torch.long, device=self.device)
-                label_ids = torch.tensor(self._encode_labels(labels), dtype=torch.long, device=self.device)
-                self.model.zero_grad()
+            for sentence_ids, label_ids, lengths in train_loader:
+                sentence_ids = sentence_ids.to(self.device, non_blocking=use_cuda)
+                label_ids = label_ids.to(self.device, non_blocking=use_cuda)
+                lengths = lengths.to(self.device, non_blocking=use_cuda)
+
+                optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    loss = self.model.neg_log_likelihood(sentence_ids, label_ids)
+                    loss = self.model.neg_log_likelihood_batch(sentence_ids, label_ids, lengths)
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-                total_loss += float(loss.detach().item())
+                total_loss += float(loss.detach().item()) * sentence_ids.size(0)
             avg_loss = total_loss / max(len(examples), 1)
             print(f"[REL] Epoch {epoch + 1}/{epochs} - avg loss: {avg_loss:.4f}")
 
